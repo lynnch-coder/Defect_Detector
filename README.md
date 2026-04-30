@@ -27,6 +27,11 @@ patchcore_project/
 ├── baseline/
 │   └── clip_baseline.py
 │
+├── outputs/
+│   ├── memory_banks/
+│   ├── faiss_indices/
+│   └── heatmaps/
+│
 ├── config.py
 ├── train.py
 └── test.py
@@ -40,7 +45,7 @@ patchcore_project/
 | `models/backbone.py` | Load frozen WideResNet50, register layer2+layer3 hooks |
 | `core/feature_extractor.py` | Forward pass, patch aggregation, return (N, D) tensor |
 | `core/coreset.py` | Greedy k-center, return subsampled indices |
-| `core/memory_bank.py` | Save/load coreset to disk as .pt |
+| `core/memory_bank.py` | Save/load coreset and faiss index to disk |
 | `core/scoring.py` | faiss index, NN search, re-weighting, heatmap generation |
 | `evaluation/metrics.py` | Image AUROC, Pixel AUROC |
 | `evaluation/visualize.py` | Heatmap overlays, results grid |
