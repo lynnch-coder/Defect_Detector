@@ -1,0 +1,10 @@
+torch
+torchvision
+faiss-gpu-cu12
+open_clip_torch
+scikit-learn
+scipy
+tqdm
+matplotlib
+Pillow
+numpy
