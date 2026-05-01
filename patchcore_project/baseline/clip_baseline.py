@@ -1,1 +1,0 @@
-# clip_baseline.py
