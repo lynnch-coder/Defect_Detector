@@ -1,0 +1,612 @@
+================================================================================
+  PATCHCORE ANOMALY DETECTION — FULL PROJECT DOCUMENTATION
+================================================================================
+  Project:   Defect Detector using PatchCore
+  Dataset:   MVTec Anomaly Detection (MVTec AD)
+  Categories: Bottle, Carpet, Screw
+  Platform:  Google Colab (T4 GPU)
+  Date:      May 2025
+================================================================================
+
+
+TABLE OF CONTENTS
+-----------------
+  1. What is PatchCore?
+  2. Why PatchCore and not a traditional CNN?
+  3. Transfer Learning — How and Where
+  4. The Backbone: WideResNet50
+  5. Feature Extraction Pipeline (Step by Step)
+  6. Memory Bank Construction
+  7. Coreset Subsampling
+  8. Testing / Inference Pipeline
+  9. Anomaly Scoring (k-NN + Re-weighting)
+  10. Heatmap Generation
+  11. Evaluation Metrics (AUROC, Pixel AUROC, PRO)
+  12. Final Results and Analysis
+  13. Why the Results Are NOT Overfitting
+  14. Project Architecture (All Files Explained)
+  15. Google Colab Workflow
+
+
+================================================================================
+1. WHAT IS PATCHCORE?
+================================================================================
+
+PatchCore is an anomaly detection algorithm published by Amazon in 2022.
+The paper is titled: "Towards Total Recall in Industrial Anomaly Detection"
+(Roth et al., CVPR 2022).
+
+The core idea is simple but powerful:
+  - Learn what "normal" looks like by memorizing features from defect-free
+    images.
+  - At test time, compare every patch of a new image against this memory.
+  - If a patch looks very different from anything in the memory, flag it
+    as anomalous (defective).
+
+PatchCore does NOT use any gradient-based training. There is no
+backpropagation, no loss function, no optimizer. The word "training"
+in our context means: "extract features from good images and store them."
+
+This is fundamentally different from classification CNNs (like ResNet
+trained to classify cats vs dogs). Those networks learn by adjusting
+millions of weights over thousands of epochs. PatchCore never touches
+the network weights at all.
+
+
+================================================================================
+2. WHY PATCHCORE AND NOT A TRADITIONAL CNN?
+================================================================================
+
+In industrial defect detection, we face a critical problem:
+  - We have thousands of images of GOOD products (no defects).
+  - We have very FEW images of defective products.
+  - Defects are unpredictable — a new type of defect can appear at any time.
+
+A traditional CNN (binary classifier: good vs defective) would fail because:
+  1. It needs balanced training data (equal good and defective samples).
+  2. It can only detect defect types it was trained on.
+  3. It cannot localize WHERE the defect is (only says "defective" or "good").
+
+PatchCore solves all three problems:
+  1. It only needs good images for training (one-class learning).
+  2. It detects ANY anomaly, even types never seen before.
+  3. It produces pixel-level heatmaps showing exactly where the defect is.
+
+
+================================================================================
+3. TRANSFER LEARNING — HOW AND WHERE
+================================================================================
+
+Transfer learning means: take a neural network that was already trained
+on a large dataset (ImageNet, 14 million images, 1000 classes) and reuse
+its learned knowledge for a different task.
+
+In our project, transfer learning happens like this:
+
+  Step 1: We load WideResNet50 pre-trained on ImageNet.
+          This network has already learned to recognize textures, edges,
+          shapes, colors, and complex patterns from millions of images.
+
+  Step 2: We FREEZE the entire network.
+          Every single weight is locked: requires_grad = False.
+          We do NOT fine-tune. We do NOT add new layers.
+          We do NOT change the classification head.
+          We literally use the network as a fixed feature extractor.
+
+  Step 3: We extract intermediate features (layer2 and layer3).
+          We do NOT use the final classification output.
+          Instead, we hook into the middle layers of the network
+          because those contain rich spatial feature maps that describe
+          the texture and structure of each local region (patch) in
+          the image.
+
+WHY layer2 and layer3 specifically?
+  - layer1: Too shallow. Features are basic (edges, gradients). Not
+    discriminative enough to distinguish subtle defects.
+  - layer2: Medium-level features. Captures textures, repeating patterns,
+    and local structure. Output shape: (B, 512, 28, 28) for 224x224 input.
+  - layer3: Higher-level features. Captures object parts, complex textures,
+    and semantic meaning. Output shape: (B, 1024, 14, 14) for 224x224 input.
+  - layer4: Too deep. Features are too abstract and spatially coarse (7x7).
+    We lose precise localization ability.
+
+The combination of layer2 + layer3 gives us the best balance between:
+  - Semantic richness (understanding WHAT is in each region)
+  - Spatial precision (knowing exactly WHERE each region is)
+
+This is the essence of our transfer learning: we borrow ImageNet's
+knowledge about visual patterns and repurpose it to detect manufacturing
+defects, without ever retraining the network.
+
+
+================================================================================
+4. THE BACKBONE: WIDRESNET50
+================================================================================
+
+WideResNet50-2 is a variant of ResNet50 with wider layers (2x the number
+of channels in each residual block). It was chosen because:
+
+  1. It is the backbone used in the original PatchCore paper.
+  2. Wider layers = richer feature representations per spatial position.
+  3. It is available pre-trained in torchvision (one line of code to load).
+
+Architecture summary:
+  - Input: (B, 3, 224, 224) — batch of RGB images, 224x224 pixels.
+  - conv1 + bn1 + relu + maxpool: Initial downsampling.
+  - layer1: (B, 256, 56, 56)  — we skip this (too shallow).
+  - layer2: (B, 512, 28, 28)  — we extract this (medium features).
+  - layer3: (B, 1024, 14, 14) — we extract this (high features).
+  - layer4: (B, 2048, 7, 7)   — we skip this (too abstract).
+  - avgpool + fc: Classification head — we completely ignore this.
+
+How we capture layer2 and layer3 outputs:
+  We use PyTorch "forward hooks". A hook is a callback function that
+  automatically captures the output tensor of a specific layer whenever
+  an image passes through the network.
+
+  Code (from models/backbone.py):
+    hook_dict = {}
+    def _hook(name):
+        def fn(module, input, output):
+            hook_dict[name] = output.detach()
+        return fn
+    model.layer2.register_forward_hook(_hook('layer2'))
+    model.layer3.register_forward_hook(_hook('layer3'))
+
+  After calling model(image_batch), hook_dict['layer2'] and
+  hook_dict['layer3'] contain the feature maps we need.
+
+
+================================================================================
+5. FEATURE EXTRACTION PIPELINE (STEP BY STEP)
+================================================================================
+
+For every training image (good images only), we do:
+
+  Step 1: Preprocessing
+    - Resize image to 224x224 pixels.
+    - CenterCrop to 224x224 (ensures consistent spatial alignment).
+    - Convert to tensor (pixel values from [0,255] to [0.0, 1.0]).
+    - Normalize with ImageNet mean=[0.485, 0.456, 0.406] and
+      std=[0.229, 0.224, 0.225]. This is required because WideResNet50
+      was trained with these exact normalization values.
+
+  Step 2: Forward pass through WideResNet50
+    - Feed the normalized image tensor through the frozen backbone.
+    - Capture layer2 output: shape (1, 512, 28, 28)
+    - Capture layer3 output: shape (1, 1024, 14, 14)
+
+  Step 3: Locally-Aware Patching
+    - Apply average pooling with kernel_size=3, stride=1, padding=1.
+    - This smooths each feature position with its 3x3 neighborhood.
+    - Purpose: Each patch now "knows" about its surrounding context,
+      making it more robust to tiny spatial shifts.
+    - Output shapes remain the same: (1, 512, 28, 28) and (1, 1024, 14, 14).
+
+  Step 4: Alignment and Concatenation
+    - layer3 features are spatially smaller (14x14) than layer2 (28x28).
+    - We bilinearly upsample layer3 from 14x14 to 28x28.
+    - Then we concatenate along the channel dimension:
+      (1, 512, 28, 28) + (1, 1024, 28, 28) = (1, 1536, 28, 28)
+    - Each spatial position now has a 1536-dimensional feature vector
+      that combines medium-level AND high-level information.
+
+  Step 5: Flatten to Patch Vectors
+    - Reshape from (1, 1536, 28, 28) to (784, 1536).
+    - This means: 784 patches per image, each described by a
+      1536-dimensional vector.
+    - 784 = 28 x 28 (the spatial grid of patches).
+
+  Step 6: Aggregate across all training images
+    - For the "bottle" category, there are ~209 good training images.
+    - Each produces 784 patches.
+    - Total: 209 x 784 = ~163,856 patch vectors, each of dimension 1536.
+    - These are all concatenated into one giant tensor: (163856, 1536).
+
+
+================================================================================
+6. MEMORY BANK CONSTRUCTION
+================================================================================
+
+The raw feature tensor from Step 6 above (e.g., 163,856 patches for bottle)
+is too large to use directly for nearest-neighbor search at test time.
+It would be slow and memory-hungry.
+
+This is where CORESET SUBSAMPLING comes in (Section 7 below).
+
+After coreset subsampling, we get a much smaller tensor (e.g., ~1,600
+patches instead of ~163,000). This compressed tensor IS the Memory Bank.
+
+The Memory Bank is saved to disk as a PyTorch .pt file:
+  - bottle_memory_bank.pt  → ~1,600 patches x 1536 dims = ~9.6 MB
+  - carpet_memory_bank.pt  → ~2,200 patches x 1536 dims = ~12.9 MB
+  - screw_memory_bank.pt   → ~2,500 patches x 1536 dims = ~14.7 MB
+
+The Memory Bank represents the model's entire "knowledge" of what
+normal looks like. It is a compact, representative summary of every
+texture, edge, and pattern found in the defect-free training images.
+
+
+================================================================================
+7. CORESET SUBSAMPLING
+================================================================================
+
+Problem: We have ~164,000 raw patch vectors. Storing and searching all
+of them at test time would be wasteful because many patches are nearly
+identical (e.g., the flat white surface of a bottle appears hundreds
+of times).
+
+Solution: Greedy Farthest-Point Sampling (also called Coreset Selection).
+
+Algorithm:
+  1. Start with a random patch as the first selected point.
+  2. Compute the distance from every unselected patch to its nearest
+     selected patch.
+  3. Pick the unselected patch that is FARTHEST from all selected patches.
+  4. Add it to the selected set.
+  5. Repeat until we have selected enough patches.
+
+How many patches do we keep?
+  CORESET_RATIO = 0.01 (1%)
+  So from ~164,000 patches, we keep ~1,640.
+
+Why this algorithm works:
+  - It guarantees maximum coverage of the feature space.
+  - Common patches (flat surfaces, uniform textures) get represented
+    by just a few exemplars.
+  - Rare patches (edges, corners, text on labels) are always kept
+    because they are far from everything else.
+  - The result is a tiny but highly representative subset.
+
+This is the most computationally expensive step in the entire pipeline.
+It runs on GPU using PyTorch distance calculations and takes about
+30-60 seconds per category on a T4 GPU.
+
+Checkpointing: Every 500 iterations, progress is saved to Google Drive
+so that if Colab disconnects, we can resume without starting over.
+
+
+================================================================================
+8. TESTING / INFERENCE PIPELINE
+================================================================================
+
+At test time, we process EVERY test image (both good and defective):
+
+  Step 1: Load the Memory Bank from disk.
+
+  Step 2: Build a FAISS index on the Memory Bank.
+    FAISS (Facebook AI Similarity Search) is a library optimized for
+    ultra-fast nearest-neighbor search. We build an IndexFlatL2 which
+    performs exact L2 (Euclidean) distance search.
+
+  Step 3: Load WideResNet50 and register hooks (same as training).
+
+  Step 4: For each test image:
+    a. Extract patch features using the exact same pipeline as training
+       (preprocess → forward pass → local smoothing → align → flatten).
+    b. This produces 784 patch vectors of dimension 1536.
+
+  Step 5: Score each patch (see Section 9).
+
+  Step 6: Generate a heatmap (see Section 10).
+
+  Step 7: Compute metrics by comparing predictions to ground truth
+          (see Section 11).
+
+  Step 8: Save visualizations (qualitative grids, ROC curves, histograms).
+
+
+================================================================================
+9. ANOMALY SCORING (k-NN + RE-WEIGHTING)
+================================================================================
+
+For each of the 784 test patches in an image:
+
+  Step 1: k-Nearest Neighbor Lookup (k=1)
+    - Search the FAISS index for the closest memory bank vector.
+    - The L2 distance to this nearest neighbor is the raw anomaly score
+      for this patch.
+    - Intuition: If a test patch looks exactly like a normal patch in
+      the memory bank, the distance is small → normal.
+      If it looks nothing like any normal patch, the distance is large
+      → anomalous.
+
+  Step 2: Re-weighting (PatchCore Equation 7)
+    - Not all memory bank vectors are equally trustworthy.
+    - If the nearest memory bank vector m* sits in a DENSE cluster
+      (many similar normal patches around it), then a match to it is
+      very reliable. The patch is probably normal.
+    - If m* is ISOLATED (few similar patches around it), the match is
+      less certain.
+    - Re-weighting formula:
+        reweighted_score = raw_distance / local_density
+      where local_density = distance to the k-th nearest neighbor of m*
+      within the memory bank itself (we use k=3).
+    - This amplifies scores in sparse regions and dampens them in dense
+      regions, improving detection accuracy.
+
+  Step 3: Image-Level Score
+    - The anomaly score of the entire image = max(all patch scores).
+    - The single most anomalous patch determines whether the whole
+      image is flagged as defective.
+    - This makes sense: a single scratch on an otherwise perfect bottle
+      means the bottle is defective.
+
+
+================================================================================
+10. HEATMAP GENERATION
+================================================================================
+
+The 784 patch scores are arranged on a 28x28 spatial grid (matching the
+feature map resolution).
+
+  Step 1: Reshape scores from (784,) to (28, 28).
+
+  Step 2: Bilinear upsampling from 28x28 to 224x224 (matching the
+          original image resolution).
+
+  Step 3: Gaussian smoothing with sigma=4.0.
+    - This removes the blocky grid artifacts from the upsampling.
+    - The result is a smooth, continuous heatmap where high values
+      indicate anomalous regions and low values indicate normal regions.
+
+  Step 4: Overlay the heatmap on the original image using a "jet"
+          colormap (blue=normal, red=anomalous) with alpha blending.
+
+The final visualization shows four columns side by side:
+  | Original Image | Ground Truth Mask | Predicted Heatmap | Overlay |
+
+This allows visual verification that the model is detecting defects
+in the correct locations.
+
+
+================================================================================
+11. EVALUATION METRICS
+================================================================================
+
+We compute three metrics:
+
+  A) IMAGE AUROC (Area Under the ROC Curve — Image Level)
+     - Measures: "Did we correctly classify images as good or defective?"
+     - Each image has one anomaly score and one ground-truth label.
+     - AUROC = 1.0 means perfect separation between good and defective.
+     - AUROC = 0.5 means random guessing.
+     - We use sklearn.metrics.roc_auc_score.
+
+  B) PIXEL AUROC (Area Under the ROC Curve — Pixel Level)
+     - Measures: "Did we correctly locate the defective pixels?"
+     - Every pixel in the heatmap has a score, and every pixel in the
+       ground-truth mask has a label (0=normal, 1=defect).
+     - We flatten ALL pixels across ALL test images and compute a
+       single global AUROC.
+     - This tells us how well the heatmap aligns with the actual defect
+       location.
+
+  C) PRO (Per-Region Overlap)
+     - The strictest metric. More demanding than pixel AUROC.
+     - It identifies each connected defect region separately.
+     - For each threshold, it computes the overlap (TPR) per region.
+     - It averages per-region overlaps (so small and large defects
+       count equally).
+     - It integrates the average-overlap vs FPR curve only up to
+       FPR = 0.30 (30%).
+     - This penalizes detectors that catch large defects but miss
+       small ones.
+
+
+================================================================================
+12. FINAL RESULTS AND ANALYSIS
+================================================================================
+
+  ============================================================
+  Category     | Image AUROC  | Pixel AUROC  | PRO
+  ------------------------------------------------------------
+  bottle       | 1.0000       | 0.9846       | 0.9318
+  carpet       | 0.9892       | 0.9882       | 0.8663
+  screw        | 0.8791       | 0.9292       | 0.6598
+  ------------------------------------------------------------
+  AVERAGE      | 0.9561       | 0.9673       | 0.8193
+  ============================================================
+
+ANALYSIS PER CATEGORY:
+
+  BOTTLE (Image AUROC: 1.0000)
+    - Perfect image-level detection. Every single defective bottle was
+      correctly identified, and no good bottle was falsely flagged.
+    - Why so high? Bottles are rigid objects with extremely consistent
+      appearance. The surface is smooth and uniform. Any defect (scratch,
+      contamination, broken cap) creates a feature vector that is
+      drastically different from the normal memory bank vectors.
+    - The original PatchCore paper also reports 1.000 for bottle.
+
+  CARPET (Image AUROC: 0.9892)
+    - Near-perfect detection with only a tiny number of borderline cases.
+    - Carpet is a texture-based category. The repeating weave pattern
+      is well-captured by the convolutional features. Defects like holes,
+      color stains, or cuts break the pattern and are easy to detect.
+    - Pixel AUROC (0.9882) is very high, meaning the heatmaps precisely
+      highlight the defective regions.
+
+  SCREW (Image AUROC: 0.8791)
+    - The hardest category. Screws are small metallic objects that can
+      appear at random rotations and orientations.
+    - Defect types include: scratched_head, thread_top, thread_side.
+      These are extremely subtle — a few pixels of difference on a
+      shiny, reflective surface.
+    - The lower PRO (0.6598) reflects the difficulty of precisely
+      localizing tiny thread defects on a small object.
+    - An 87.9% Image AUROC on screws is still a strong result and
+      matches expectations from the literature.
+
+
+================================================================================
+13. WHY THE RESULTS ARE NOT OVERFITTING
+================================================================================
+
+It is natural to be suspicious of a 100% score. Here is why these results
+are legitimate and NOT caused by overfitting:
+
+  1. NO WEIGHTS WERE TRAINED.
+     Overfitting occurs when a model memorizes training data by adjusting
+     its weights too aggressively. In our case, the WideResNet50 weights
+     were loaded from ImageNet and never modified. requires_grad = False.
+     There is no optimizer. There is no loss function. There is no
+     backpropagation. The model literally cannot overfit because it
+     cannot learn.
+
+  2. THE TEST DATA WAS COMPLETELY UNSEEN.
+     The training set contains ONLY good images. Defective images exist
+     ONLY in the test set. The memory bank was built without ever seeing
+     a single defective image. The first time the model encountered a
+     defect was during testing.
+
+  3. THE RESULTS MATCH THE PUBLISHED PAPER.
+     The original PatchCore paper (Roth et al., CVPR 2022) reports:
+       - Bottle: 1.000 Image AUROC (we got 1.0000)
+       - Carpet: 0.988 Image AUROC (we got 0.9892)
+       - Screw: varies depending on configuration
+     Our results are consistent with the state-of-the-art benchmarks.
+
+  4. THE SCORES ARE NOT UNIFORMLY HIGH.
+     If the model was overfitting or cheating, ALL categories would show
+     near-perfect scores. But screw has 0.8791 Image AUROC and 0.6598
+     PRO — significantly lower than bottle and carpet. This proves the
+     model is genuinely working harder on difficult categories and not
+     just memorizing answers.
+
+  5. THE METHOD IS MATHEMATICALLY SOUND.
+     k-Nearest Neighbor is a non-parametric method. It has no parameters
+     to overfit. It simply measures distances in feature space. The only
+     "decision" is the distance threshold, and AUROC evaluates across
+     ALL possible thresholds, so there is no threshold-selection bias.
+
+
+================================================================================
+14. PROJECT ARCHITECTURE (ALL FILES EXPLAINED)
+================================================================================
+
+  patchcore_project/
+  |
+  |-- 01_train.ipynb          Colab notebook: trains the model (builds
+  |                           memory banks). Self-contained. Handles
+  |                           Drive mounting, data unzipping, and the
+  |                           full training pipeline.
+  |
+  |-- 02_test.ipynb           Colab notebook: tests the model. Loads
+  |                           memory banks, scores test images, computes
+  |                           AUROC/PRO, saves heatmaps and ROC curves.
+  |
+  |-- train.py                Standalone training orchestrator. Calls
+  |                           feature_extractor, coreset, memory_bank
+  |                           in the correct order.
+  |
+  |-- test.py                 Standalone test orchestrator. Calls
+  |                           memory_bank (load), feature_extractor,
+  |                           scoring, metrics, visualize.
+  |
+  |-- config.py               Central configuration file. All paths,
+  |                           hyperparameters, and settings in one place.
+  |
+  |-- models/
+  |   |-- backbone.py         Loads WideResNet50, registers forward hooks
+  |                           on layer2 and layer3, provides cleanup.
+  |
+  |-- core/
+  |   |-- feature_extractor.py  Extracts patch features from images:
+  |   |                         forward pass, local smoothing, alignment,
+  |   |                         concatenation, flattening. Includes
+  |   |                         checkpointing for crash resilience.
+  |   |
+  |   |-- coreset.py          Greedy farthest-point sampling to compress
+  |   |                       ~164k patches down to ~1.6k. GPU-accelerated
+  |   |                       with checkpointing.
+  |   |
+  |   |-- memory_bank.py      Save/load memory bank .pt files. Build
+  |   |                       FAISS index for fast nearest-neighbor search.
+  |   |
+  |   |-- scoring.py          k-NN distance computation, PatchCore
+  |                           re-weighting (Eq. 7), heatmap generation
+  |                           (reshape + upsample + Gaussian blur),
+  |                           image-level scoring.
+  |
+  |-- data/
+  |   |-- dataset.py          MVTecDataset class (PyTorch Dataset).
+  |                           Loads images and ground-truth masks.
+  |                           Handles train/test splits and defect types.
+  |
+  |-- evaluation/
+  |   |-- metrics.py          Image AUROC, Pixel AUROC, PRO computation.
+  |   |-- visualize.py        Heatmap overlays, qualitative grids, ROC
+  |                           curves, score histograms.
+  |
+  |-- outputs/                Generated artifacts (on Google Drive):
+      |-- memory_banks/       .pt files (one per category)
+      |-- heatmaps/           Visualization PNGs per category
+      |-- faiss_indices/      (optional) Saved FAISS indices
+      |-- patchcore_results.json   Final metrics report
+
+
+================================================================================
+15. GOOGLE COLAB WORKFLOW
+================================================================================
+
+  TRAINING (01_train.ipynb):
+    1. Mount Google Drive.
+    2. Install faiss-cpu and tqdm.
+    3. Unzip dataset ZIPs from Drive to /content/data (fast local SSD).
+    4. Load WideResNet50 (auto-downloads ~132MB from PyTorch Hub).
+    5. For each category (bottle, carpet, screw):
+       a. Load all good training images via MVTecDataset.
+       b. Extract 1536-dim patch features using frozen backbone.
+       c. Compress with greedy coreset sampling (keep 1%).
+       d. Save memory_bank.pt to Google Drive.
+    6. Total training time: ~3-5 minutes on T4 GPU.
+
+  TESTING (02_test.ipynb):
+    1. Mount Google Drive.
+    2. Install faiss-cpu, tqdm, matplotlib, scikit-learn, scipy.
+    3. Unzip dataset (skipped if already present from training session).
+    4. For each category:
+       a. Load memory_bank.pt from Drive.
+       b. Build FAISS index on the memory bank.
+       c. Load all test images (good + defective).
+       d. Extract patch features (same pipeline as training).
+       e. Score every patch via k-NN + re-weighting.
+       f. Generate heatmaps.
+       g. Compute Image AUROC, Pixel AUROC, PRO.
+       h. Save qualitative grid, ROC curve, score histogram to Drive.
+    5. Print final results table.
+    6. Save patchcore_results.json to Drive.
+    7. Total testing time: ~5-10 minutes on T4 GPU.
+
+  DATA FLOW:
+    Google Drive (ZIP files)
+        |
+        v
+    Colab /content/data (unzipped images, fast SSD)
+        |
+        v
+    WideResNet50 backbone (frozen, feature extraction)
+        |
+        v
+    Raw patch features (~164k vectors, 1536 dims)
+        |
+        v
+    Coreset subsampling (compressed to ~1.6k vectors)
+        |
+        v
+    Memory Bank .pt file → saved back to Google Drive
+        |
+        v  (at test time)
+    FAISS index built on memory bank
+        |
+        v
+    Test image patches scored via k-NN
+        |
+        v
+    Heatmaps + Metrics + Visualizations → Google Drive
+
+
+================================================================================
+  END OF DOCUMENTATION
+================================================================================

@@ -1,0 +1,12 @@
+torch
+torchvision
+# faiss-cpu works everywhere (Colab, local, any CUDA version)
+# swap for faiss-gpu-cu12 only if you are sure your machine has CUDA 12
+faiss-cpu
+open_clip_torch
+scikit-learn
+scipy
+tqdm
+matplotlib
+Pillow
+numpy
